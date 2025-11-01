@@ -225,6 +225,7 @@ def get_model(name="cnns", n_mels=128, fourier_dim=None,
 # =========================================================
 class Detector:
     def __init__(self, ckpt_path: str, device: Optional[str] = None):
+        # load state (pytorch 2.6 friendly)
         try:
             state = torch.load(ckpt_path, map_location="cpu")
         except Exception:
@@ -237,39 +238,36 @@ class Detector:
             model_sd = state
             saved_args = {}
 
+        # args from training
         self.sr = saved_args.get("sr", 32000)
         self.n_mels = saved_args.get("n_mels", 128)
         self.model_name = saved_args.get("model", "cnns")
-
-        # flags from training
         self.use_fourier = bool(saved_args.get("use_fourier", False))
         self.fourier_only = bool(saved_args.get("fourier_only", False))
 
+        # device
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-        # === infer fourier_dim from checkpoint if possible ===
+        # ---- infer fourier dim from checkpoint ----
         inferred_fourier_dim = None
         if self.use_fourier and not self.fourier_only:
-            # look for fusion weight
             for k, v in model_sd.items():
                 if k.startswith("fuse.0.weight") or k.startswith("fuse.0.linear.weight"):
                     in_feats = v.shape[1]     # e.g. 291
                     inferred_fourier_dim = in_feats - 256
                     break
         elif self.fourier_only:
-            # first linear layer weight gives us dim
             for k, v in model_sd.items():
                 if "0.weight" in k or "0.linear.weight" in k:
                     inferred_fourier_dim = v.shape[1]
                     break
 
         if inferred_fourier_dim is None:
-            # fall back to current code’s dimension
             inferred_fourier_dim = FOURIER_DIM
 
-        self.fourier_dim = inferred_fourier_dim  # save for later
+        self.fourier_dim = inferred_fourier_dim
 
-        # build model with inferred dim
+        # build model with correct dim
         self.model = get_model(
             self.model_name,
             self.n_mels,
@@ -281,6 +279,80 @@ class Detector:
         self.model.load_state_dict(model_sd)
         self.model.eval()
         self.use_bf16 = (self.device.type == "cuda") and torch.cuda.is_bf16_supported()
+
+        print(f"[app] loaded model. use_fourier={self.use_fourier}, fourier_only={self.fourier_only}, fourier_dim={self.fourier_dim}, sr={self.sr}")
+
+    # ------------ internal: score a single clip ------------
+    @torch.no_grad()
+    def _score_clip(self, y: np.ndarray) -> float:
+        # 1) logmel branch (if not fourier_only)
+        if not self.fourier_only:
+            logmel = to_logmel_torch(y, self.sr, self.n_mels)
+            x = logmel.unsqueeze(0).to(self.device)   # (1,1,M,T)
+        # 2) fourier branch (if needed)
+        if self.use_fourier or self.fourier_only:
+            fvec = extract_fourier_features(y, self.sr)   # maybe 30
+            # pad/trim to checkpoint dim
+            if fvec.shape[0] < self.fourier_dim:
+                fvec = np.pad(fvec, (0, self.fourier_dim - fvec.shape[0]))
+            elif fvec.shape[0] > self.fourier_dim:
+                fvec = fvec[:self.fourier_dim]
+            f = torch.from_numpy(fvec).float().unsqueeze(0).to(self.device)
+
+        # 3) forward
+        with torch.autocast(device_type=self.device.type,
+                            dtype=(torch.bfloat16 if self.use_bf16 else torch.float16)):
+            if self.fourier_only:
+                logits = self.model(f)
+            elif self.use_fourier:
+                logits = self.model(x, f)
+            else:
+                logits = self.model(x)
+
+        prob = torch.softmax(logits.float(), dim=1)[0, 1].item()
+        return float(prob)
+
+    # ------------ public: score a file ------------
+    @torch.no_grad()
+    def predict(self,
+                filepath: str,
+                mode: str = "center",
+                clip_seconds: float = 10.0,
+                win_seconds: float = 6.0,
+                hop_seconds: float = 3.0,
+                agg: str = "mean") -> dict:
+        y, _ = load_audio_any(filepath, self.sr)
+        L = int(self.sr * clip_seconds)
+
+        if mode == "center":
+            y0 = center_crop(y, L)
+            scores = [self._score_clip(y0)]
+        else:
+            windows = make_windows(y, self.sr, win_seconds, hop_seconds)
+            scores = [self._score_clip(w) for w in windows]
+
+        if agg == "mean":
+            agg_score = float(np.mean(scores))
+        elif agg == "max":
+            agg_score = float(np.max(scores))
+        else:
+            agg_score = float(np.median(scores))
+
+        return {
+            "file": os.path.basename(filepath),
+            "sr": self.sr,
+            "duration_sec": round(len(y)/self.sr, 3),
+            "mode": mode,
+            "window_scores": [float(s) for s in scores],
+            "aggregate": agg_score,
+            "label": "AI" if agg_score >= 0.5 else "REAL",
+            "flags": {
+                "use_fourier": self.use_fourier,
+                "fourier_only": self.fourier_only,
+                "fourier_dim": self.fourier_dim,
+            }
+        }
+
 
 # =========================================================
 # Gradio UI
@@ -297,11 +369,11 @@ def build_interface(detector: Detector):
         audio = gr.Audio(sources=["upload", "microphone"], type="filepath",
                          label="Upload / record WAV/MP3")
         with gr.Accordion("Inference options", open=False):
-            mode = gr.Radio(["center", "sliding"], value="center", label="mode")
+            mode = gr.Radio(["center", "sliding"], value="sliding", label="mode")
             clip_seconds = gr.Slider(3, 30, value=10, step=1, label="center-crop seconds")
-            win_seconds  = gr.Slider(3, 15, value=6, step=1, label="sliding window seconds")
+            win_seconds  = gr.Slider(3, 15, value=10, step=1, label="sliding window seconds")
             hop_seconds  = gr.Slider(1, 10, value=3, step=1, label="sliding hop seconds")
-            agg          = gr.Radio(["mean", "max", "median"], value="mean", label="aggregate")
+            agg          = gr.Radio(["mean", "max", "median"], value="max", label="aggregate")
         btn = gr.Button("Detect", variant="primary")
         out_label = gr.Label(label="Prediction")
         out_num   = gr.Number(label="AI probability")
@@ -340,4 +412,5 @@ if __name__ == "__main__":
     args = parse_args()
     det = Detector(args.ckpt)
     ui = build_interface(det)
-    ui.launch(server_name=args.server_name, server_port=args.server_port, share=args.share)
+    # ui.launch(server_name=args.server_name, server_port=args.server_port, share=args.share)
+    ui.launch(share=True)

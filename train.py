@@ -67,8 +67,14 @@ def random_gain(y):
 # ---- Band-wise peak features ----
 from scipy.signal import find_peaks
 
-# 音乐常用频段：
-BANDS = [(50, 300), (300, 1000), (1000, 3000), (3000, 8000)]  # Hz
+# 频段划分
+BANDS = [
+    (50, 300),
+    (300, 1000),
+    (1000, 3000),
+    (3000, 5000),   
+    (5000, 8000),
+]
 PEAK_TOPK = 3  # 每个频段统计 top-k 峰值（按 prominence 排序）
 
 def _band_peaks_features(freqs, psd_db, bands=BANDS, topk=PEAK_TOPK):
@@ -282,62 +288,96 @@ class TwoClassAudio(Dataset):
 # =========================================================
 # Models
 # =========================================================
-class SmallCNN(nn.Module):
-    def __init__(self, n_mels=128, n_classes=2):
+class DeezerSimpleCNN(nn.Module):
+    """
+    A Deezer-style simple CNN for log-mel inputs.
+    Input: (B, 1, n_mels, T)
+    Output: logits (B, 2)  OR  embedding via forward_features()
+    """
+    def __init__(self, n_mels=128, n_classes=2, in_ch=1):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d((2,2)),
-            nn.Conv2d(32,64,3,padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d((2,2)),
-            nn.Conv2d(64,128,3,padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d((2,2)),
-            nn.Conv2d(128,256,3,padding=1), nn.BatchNorm2d(256), nn.ReLU(), nn.AdaptiveAvgPool2d((1,1)),
+        # block1
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_ch, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 2))    # (M,T) -> (M/2, T/2)
         )
-        self.fc = nn.Linear(256, n_classes)
+        # block2
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 2))    # -> (M/4, T/4)
+        )
+        # block3
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 2))    # -> (M/8, T/8)
+        )
+        # block4 (optional, makes it a bit deeper like Deezer)
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),  # -> (256,1,1)
+        )
+        self.head = nn.Linear(256, n_classes)
 
-    def forward(self, x):  # x: (B,1,M,T)
-        h = self.net(x)
-        h = h.squeeze(-1).squeeze(-1)
-        return self.fc(h)
+    def forward_features(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)     # (B,256,1,1)
+        x = x.squeeze(-1).squeeze(-1)  # (B,256)
+        return x
 
-class CNNWithFourierHead(nn.Module):
-    def __init__(self, n_mels=128, fourier_dim=FOURIER_DIM, n_classes=2):
+    def forward(self, x):
+        emb = self.forward_features(x)
+        return self.head(emb)
+
+
+class DeezerCNNWithFourier(nn.Module):
+    """
+    CNN (log-mel) + explicit Fourier vector
+    fuse_dim = 256 + fourier_dim
+    """
+    def __init__(self, n_mels=128, fourier_dim=10, n_classes=2):
         super().__init__()
-        # CNN backbone -> 256-d embedding
-        self.backbone = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d((2,2)),
-            nn.Conv2d(32,64,3,padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d((2,2)),
-            nn.Conv2d(64,128,3,padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d((2,2)),
-            nn.Conv2d(128,256,3,padding=1), nn.BatchNorm2d(256), nn.ReLU(), nn.AdaptiveAvgPool2d((1,1)),
-        )
-        self.head = nn.Sequential(
-            nn.Linear(256 + fourier_dim, 256), nn.ReLU(),
+        self.cnn = DeezerSimpleCNN(n_mels=n_mels, n_classes=n_classes)
+        self.fuse = nn.Sequential(
+            nn.Linear(256 + fourier_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(256),         # make fusion more stable
             nn.Dropout(0.2),
             nn.Linear(256, n_classes)
         )
 
     def forward(self, x, fvec):
-        h = self.backbone(x)            # (B,256,1,1)
-        h = h.squeeze(-1).squeeze(-1)   # (B,256)
-        z = torch.cat([h, fvec], dim=1) # (B,256+D)
-        return self.head(z)
+        emb = self.cnn.forward_features(x)  # (B,256)
+        z = torch.cat([emb, fvec], dim=1)   # (B,256+fourier_dim)
+        return self.fuse(z)
 
 def get_model(name="cnns", n_mels=128, fourier_dim=None, use_fourier=False, fourier_only=False):
     if fourier_only:
-        # Only Fourier linear head
         return nn.Sequential(
             nn.LayerNorm(fourier_dim),
             nn.Linear(fourier_dim, 64), nn.ReLU(),
             nn.Linear(64, 2)
         )
     if use_fourier:
-        return CNNWithFourierHead(n_mels=n_mels, fourier_dim=fourier_dim or FOURIER_DIM)
-    if name=="cnns":
-        return SmallCNN(n_mels=n_mels)
-    # ResNet18 (1ch)
+        return DeezerCNNWithFourier(n_mels=n_mels, fourier_dim=fourier_dim or FOURIER_DIM)
+    if name == "cnns":
+        return DeezerSimpleCNN(n_mels=n_mels)
+    # keep your resnet branch
     import torchvision.models as tvm
     m = tvm.resnet18(weights=None)
     m.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
     m.fc = nn.Linear(512, 2)
     return m
+
 
 # =========================================================
 # Mixup (optional)
